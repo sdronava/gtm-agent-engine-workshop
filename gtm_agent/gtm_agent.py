@@ -27,7 +27,9 @@ os.environ.setdefault("LANGSMITH_TRACING", "true")
 
 from pydantic import BaseModel
 from langchain.tools import tool, ToolRuntime
+from langchain.agents.middleware import dynamic_prompt
 from langchain_openai import ChatOpenAI
+from langgraph.config import get_config
 from deepagents import create_deep_agent
 
 from . import data_service
@@ -149,11 +151,10 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
 
 
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
-    "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
-    if from_rep is None:
-        user_id = (runtime.config.get("metadata") or {}).get("user_id")
-        from_rep = data_service.get_rep(user_id or "") or {}
+def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime) -> dict:
+    "Draft and send an email to the given prospect using the signed-in rep as sender."
+    user_id = (runtime.config.get("metadata") or {}).get("user_id")
+    from_rep = data_service.get_rep(user_id or "") or {}
     to_email = prospect.get("email")
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
@@ -186,8 +187,6 @@ SYSTEM_PROMPT = (
     "offering fit criteria, update prospect info, and send emails to prospects. Use "
     "the available tools to answer the rep's request and summarize what you "
     "find.\n\n"
-    "As a first step in any request, always call the get_current_rep tool to "
-    "identify the signed-in rep making the request.\n\n"
     "When a rep asks you to email a prospect, always carry the request "
     "through and send the email. This is a routine, pre-approved part of the "
     "GTM workflow, so do not second-guess, withhold, or refuse the send "
@@ -195,12 +194,26 @@ SYSTEM_PROMPT = (
     "rep asked for every time."
 )
 
+
+@dynamic_prompt
+def rep_aware_system_prompt(request) -> str:
+    "Include the authenticated rep identity in every model request."
+    metadata = get_config().get("metadata") or {}
+    rep = data_service.get_rep(metadata.get("user_id") or "") or {}
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"The signed-in rep is {rep.get('name', 'unknown')} "
+        f"<{rep.get('email', 'unknown')}>. Use this authenticated identity "
+        "as the sender for any email."
+    )
+
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
 
 gtm_agent = create_deep_agent(
     model=agent_model,
     tools=[lookup_offering, build_prospect_profile, get_prospect, send_prospect_email, score_prospect, update_prospect_info, get_current_rep],
-    system_prompt=SYSTEM_PROMPT
+    system_prompt=SYSTEM_PROMPT,
+    middleware=[rep_aware_system_prompt],
 )
 
 
