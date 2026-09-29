@@ -17,6 +17,7 @@ Install:
 import json
 import os
 import random
+import re
 import uuid
 
 from dotenv import load_dotenv
@@ -26,6 +27,8 @@ load_dotenv(override=True)
 os.environ.setdefault("LANGSMITH_TRACING", "true")
 
 from pydantic import BaseModel
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain.tools import tool, ToolRuntime
 from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
@@ -195,12 +198,94 @@ SYSTEM_PROMPT = (
     "rep asked for every time."
 )
 
+
+def _tool_result(message):
+    "Return a tool result's content as a dictionary when possible."
+    content = message.content
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, str):
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            return {}
+        return result if isinstance(result, dict) else {}
+    return {}
+
+
+def _verified_results(messages):
+    "Return verified send and score results from the message history."
+    verified_send = None
+    verified_score = None
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        result = _tool_result(message)
+        if message.name == "send_prospect_email":
+            if result.get("status") == "sent" and result.get("message_id"):
+                verified_send = result
+        elif message.name == "score_prospect":
+            score = result.get("score")
+            if (
+                isinstance(score, (int, float))
+                and not isinstance(score, bool)
+                and result.get("max_score") == 100
+            ):
+                verified_score = result
+    return verified_send, verified_score
+
+
+def _claims_email_sent(text):
+    "Return whether text claims an email was sent."
+    if re.search(r"\b(?:not|never|unable|couldn['’]?t|could not|didn['’]?t|did not)\b.{0,30}\b(?:send|sent)\b", text, re.I):
+        return False
+    return bool(
+        re.search(r"\b(?:email|message|note)\b.{0,80}\b(?:sent|delivered|dispatched)\b", text, re.I)
+        or re.search(r"\b(?:sent|delivered|dispatched)\b.{0,80}\b(?:email|message|note)\b", text, re.I)
+    )
+
+
+def _claims_score(text):
+    "Return whether text reports a numeric score out of 100."
+    return bool(re.search(r"\b\d{1,3}(?:\.\d+)?\s*(?:/|out of)\s*100\b", text, re.I))
+
+
+class VerifiedActionMiddleware(AgentMiddleware):
+    "Replace unsupported send and score claims in final model responses."
+
+    def after_model(self, state, runtime):
+        messages = state.get("messages", [])
+        if not messages or not isinstance(messages[-1], AIMessage) or messages[-1].tool_calls:
+            return None
+        candidate = messages[-1].content
+        if not isinstance(candidate, str):
+            return None
+
+        verified_send, verified_score = _verified_results(messages)
+        claims_send = _claims_email_sent(candidate)
+        claims_score = _claims_score(candidate)
+        invalid_body = claims_send and "body" in candidate.lower() and (
+            not verified_send or verified_send.get("body", "") not in candidate
+        )
+        unsupported_send = claims_send and (not verified_send or invalid_body)
+        unsupported_score = claims_score and not verified_score
+        if not unsupported_send and not unsupported_score:
+            return None
+
+        statements = []
+        if unsupported_send:
+            statements.append("The email was not sent because no successful send confirmation was produced.")
+        if unsupported_score:
+            statements.append("No verified fit score was produced.")
+        return {"messages": [AIMessage(content=" ".join(statements))]}
+
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
 
 gtm_agent = create_deep_agent(
     model=agent_model,
     tools=[lookup_offering, build_prospect_profile, get_prospect, send_prospect_email, score_prospect, update_prospect_info, get_current_rep],
-    system_prompt=SYSTEM_PROMPT
+    system_prompt=SYSTEM_PROMPT,
+    middleware=[VerifiedActionMiddleware()],
 )
 
 
